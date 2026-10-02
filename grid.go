@@ -15,7 +15,8 @@ import (
 // structural no-op; only 'i' (insert) stays meaningful.
 
 const (
-	gridPage        = 20
+	gridPage        = 20  // Ctrl+F / Ctrl+B
+	gridJump        = 100 // n / p
 	gridMaxColWidth = 40
 	gridMinColWidth = 3
 )
@@ -31,6 +32,7 @@ type gridModel struct {
 	vcol     int
 	pending  string
 	height   int
+	loading  bool // a page fetch is in flight
 }
 
 func newGridModel() *gridModel { return &gridModel{} }
@@ -40,6 +42,7 @@ func (g *gridModel) setResult(r *Result) {
 	g.row, g.col, g.top, g.left = 0, 0, 0, 0
 	g.visual = false
 	g.pending = ""
+	g.loading = false
 	g.widths = nil
 	if r == nil {
 		return
@@ -119,6 +122,10 @@ func (g *gridModel) removeRows(idx []int) {
 	if g.res.RowIDs != nil {
 		g.res.RowIDs = ids
 	}
+	if p := g.res.Page; p != nil {
+		// deleted rows no longer exist, so the next page starts earlier
+		p.Next -= int64(len(del))
+	}
 	g.visual = false
 	if g.row >= len(rows) {
 		g.row = max(0, len(rows)-1)
@@ -135,6 +142,23 @@ func (g *gridModel) appendRow(rowid int64, cells []Cell) {
 	g.row = len(g.res.Rows) - 1
 }
 
+// rowBase is the absolute (1-based display) number of Rows[0] minus one,
+// so later pages keep counting from where the previous page stopped.
+func (g *gridModel) rowBase() int {
+	if g.res == nil || g.res.Page == nil {
+		return 0
+	}
+	return int(g.res.Page.Offset - g.res.Page.BaseOffset)
+}
+
+func (g *gridModel) hasMore() bool {
+	return g.res != nil && g.res.Page != nil && g.res.Page.HasMore
+}
+
+func (g *gridModel) hasPrev() bool {
+	return g.res != nil && g.res.Page != nil && g.res.Page.Offset > g.res.Page.BaseOffset
+}
+
 func (g *gridModel) title() string {
 	if g.res == nil {
 		return "Result"
@@ -144,13 +168,27 @@ func (g *gridModel) title() string {
 		return "Result"
 	}
 	pos := ""
-	if len(r.Rows) > 0 {
+	base := g.rowBase()
+	switch {
+	case len(r.Rows) == 0:
+		pos = " 0 rows"
+	case r.Page != nil:
+		pos = fmt.Sprintf(" %d (rows %d-%d", base+g.row+1, base+1, base+len(r.Rows))
+		if g.hasPrev() {
+			pos += " ▲"
+		}
+		if g.hasMore() {
+			pos += " ▼ more"
+		}
+		pos += ")"
+	default:
 		pos = fmt.Sprintf(" %d/%d", g.row+1, len(r.Rows))
 		if r.Truncated {
 			pos += "+"
 		}
-	} else {
-		pos = " 0 rows"
+	}
+	if g.loading {
+		pos += " loading..."
 	}
 	tag := ""
 	switch {
@@ -284,9 +322,15 @@ func (g *gridModel) view(w, h int, focused bool) []string {
 		return out
 	}
 	n := len(r.Rows)
-	numW := max(1, len(itoa(n)))
+	base := g.rowBase()
+	numW := max(1, len(itoa(base+n)))
 	// each row is followed by a horizontal rule, so a row takes two lines
-	bodyH := (h - 2 + 1) / 2
+	// (the last line is reserved for the "more rows" marker when paging)
+	lines := h - 2
+	if g.hasMore() {
+		lines--
+	}
+	bodyH := (lines + 1) / 2
 	if bodyH < 1 {
 		bodyH = 1
 	}
@@ -384,7 +428,7 @@ func (g *gridModel) view(w, h int, focused bool) []string {
 			out = append(out, rule)
 		}
 		var b strings.Builder
-		num := padLeft(itoa(ri+1), numW)
+		num := padLeft(itoa(base+ri+1), numW)
 		if ri == g.row {
 			b.WriteString(stBold.Render(num))
 		} else {
@@ -418,6 +462,14 @@ func (g *gridModel) view(w, h int, focused bool) []string {
 		}
 		out = append(out, b.String())
 	}
+	// more rows in the database: pin a marker to the bottom line
+	if g.hasMore() {
+		for len(out) < h-1 {
+			out = append(out, "")
+		}
+		out = append(out, stFocusTitle.Render(truncate(" ▼ more rows in database - PgDn/Ctrl+F continues, n/p jumps 100 rows", w)))
+		return out
+	}
 	// close the table with a bottom rule when there is room
 	if len(out) < h {
 		out = append(out, stDim.Render(truncate(bottomText, w)))
@@ -441,10 +493,27 @@ func (m *model) gridKey(msg tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	}
+	if r := g.res; r != nil && r.Page != nil {
+		switch key {
+		case "ctrl+f", "pgdown", "ctrl+d":
+			// paging past the loaded rows continues with the next page
+			if g.hasMore() && g.row+gridPage >= len(r.Rows) {
+				return m.loadMore(g.row + gridPage)
+			}
+		case "j", "down":
+			if g.hasMore() && g.row >= len(r.Rows)-1 {
+				return m.loadMore(g.row + 1)
+			}
+		}
+	}
 	if g.move(key) {
 		return nil
 	}
 	switch key {
+	case "n":
+		return m.pageJump(gridJump)
+	case "p":
+		return m.pageJump(-gridJump)
 	case "g":
 		g.pending = "g"
 	case "?":
@@ -705,4 +774,116 @@ func (m *model) insertRowFlow() tea.Cmd {
 	}
 	m.modal = im
 	return nil
+}
+
+// ---------------------------------------------------------------- paging
+
+type pageLoadedMsg struct {
+	res     *Result
+	page    *Page
+	offset  int64 // offset the page was fetched at
+	replace bool  // replace the loaded rows (n/p) instead of appending
+	target  int64 // absolute offset the cursor should land on
+	err     error
+}
+
+func (m *model) fetchPageCmd(r *Result, offset, limit int64, replace bool, target int64) tea.Cmd {
+	m.grid.loading = true
+	return func() tea.Msg {
+		p, err := m.db.FetchPage(context.Background(), r, offset, limit)
+		return pageLoadedMsg{res: r, page: p, offset: offset, replace: replace, target: target, err: err}
+	}
+}
+
+// loadMore appends the next page; the cursor moves to row index target
+// (relative to the loaded rows) once it arrives.
+func (m *model) loadMore(target int) tea.Cmd {
+	g := m.grid
+	if g.loading {
+		return nil
+	}
+	p := g.res.Page
+	return m.fetchPageCmd(g.res, p.Next, p.Limit, false, p.Offset+int64(target))
+}
+
+// pageJump moves the cursor delta rows. Inside the loaded rows it only moves
+// the cursor; beyond them it replaces the loaded rows with the 100-row page
+// containing the target.
+func (m *model) pageJump(delta int) tea.Cmd {
+	g := m.grid
+	r := g.res
+	if r == nil || !r.HasRows || g.loading {
+		return nil
+	}
+	if r.Page == nil {
+		if len(r.Rows) == 0 {
+			return nil
+		}
+		g.row = max(0, min(len(r.Rows)-1, g.row+delta))
+		return nil
+	}
+	p := r.Page
+	abs := p.Offset + int64(g.row)
+	want := max(p.BaseOffset, abs+int64(delta))
+	if want >= p.Offset && want < p.Offset+int64(len(r.Rows)) {
+		g.row = int(want - p.Offset)
+		return nil
+	}
+	if delta > 0 && !p.HasMore {
+		if len(r.Rows) > 0 {
+			g.row = len(r.Rows) - 1
+		}
+		m.setStatus("no more rows", false)
+		return nil
+	}
+	start := p.BaseOffset + (want-p.BaseOffset)/gridJump*gridJump
+	return m.fetchPageCmd(r, start, gridJump, true, want)
+}
+
+func (m *model) applyPage(msg pageLoadedMsg) {
+	g := m.grid
+	g.loading = false
+	if g.res != msg.res {
+		return // a new query replaced the result meanwhile
+	}
+	if msg.err != nil {
+		m.setStatus("loading rows failed: "+msg.err.Error(), true)
+		return
+	}
+	r := msg.res
+	p := r.Page
+	pg := msg.page
+	if msg.replace {
+		r.Rows = pg.Rows
+		if r.Edit != nil {
+			r.RowIDs = pg.RowIDs
+		}
+		p.Offset = msg.offset
+		p.Next = msg.offset + int64(len(pg.Rows))
+		g.visual = false
+		g.top = 0
+	} else {
+		r.Rows = append(r.Rows, pg.Rows...)
+		if r.Edit != nil {
+			r.RowIDs = append(r.RowIDs, pg.RowIDs...)
+		}
+		p.Next += int64(len(pg.Rows))
+	}
+	p.HasMore = pg.HasMore
+	for _, row := range pg.Rows {
+		g.widen(row)
+	}
+	if len(r.Rows) == 0 {
+		g.row = 0
+	} else {
+		g.row = int(max(0, min(int64(len(r.Rows)-1), msg.target-p.Offset)))
+	}
+	base := g.rowBase()
+	status := fmt.Sprintf("rows %d-%d loaded", base+1, base+len(r.Rows))
+	if p.HasMore {
+		status += ", more available"
+	} else {
+		status += ", end of result"
+	}
+	m.setStatus(status, false)
 }

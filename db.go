@@ -303,6 +303,75 @@ type Result struct {
 	Truncated     bool
 	Elapsed       time.Duration
 	SchemaChanged bool
+	Page          *PageInfo // set when the query ends in LIMIT n [OFFSET m]
+}
+
+// PageInfo lets the grid fetch further pages of a LIMITed query.
+type PageInfo struct {
+	Base       string // statement without its LIMIT clause
+	Limit      int64  // page size from the original LIMIT
+	BaseOffset int64  // OFFSET of the original statement
+	Offset     int64  // offset of Rows[0]
+	Next       int64  // offset of the first row not yet loaded
+	HasMore    bool   // at least one more row exists after Next
+}
+
+// Page holds rows fetched by FetchPage.
+type Page struct {
+	Rows    [][]Cell
+	RowIDs  []int64
+	HasMore bool
+}
+
+// FetchPage reads limit rows starting at offset for a paged result, using
+// the same editable rewrite as the original query so rowids stay available.
+// One extra row is requested to learn whether more rows exist.
+func (d *DB) FetchPage(ctx context.Context, r *Result, offset, limit int64) (*Page, error) {
+	if r.Page == nil {
+		return nil, errors.New("result is not paged")
+	}
+	q := fmt.Sprintf("%s LIMIT %d OFFSET %d", r.Page.Base, limit+1, offset)
+	pr, err := d.QueryEditable(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	if len(pr.Columns) != len(r.Columns) || (r.Edit != nil) != (pr.Edit != nil) {
+		return nil, errors.New("result shape changed; re-run the query")
+	}
+	p := &Page{Rows: pr.Rows, RowIDs: pr.RowIDs}
+	if int64(len(p.Rows)) > limit {
+		p.HasMore = true
+		p.Rows = p.Rows[:limit]
+		if p.RowIDs != nil {
+			p.RowIDs = p.RowIDs[:limit]
+		}
+	}
+	return p, nil
+}
+
+// queryPaged runs a "... LIMIT n [OFFSET m]" query, fetching one extra row
+// to know whether more rows follow.
+func (d *DB) queryPaged(ctx context.Context, stmt string) (*Result, error) {
+	base, limit, offset, ok := parseLimit(stmt)
+	if !ok || limit >= MaxResultRows {
+		return d.QueryEditable(ctx, stmt)
+	}
+	r, err := d.QueryEditable(ctx, fmt.Sprintf("%s LIMIT %d OFFSET %d", base, limit+1, offset))
+	if err != nil {
+		// the rewrite is ours; fall back to exactly what the user wrote
+		return d.QueryEditable(ctx, stmt)
+	}
+	pi := &PageInfo{Base: base, Limit: limit, BaseOffset: offset, Offset: offset}
+	if int64(len(r.Rows)) > limit {
+		pi.HasMore = true
+		r.Rows = r.Rows[:limit]
+		if r.RowIDs != nil {
+			r.RowIDs = r.RowIDs[:limit]
+		}
+	}
+	pi.Next = offset + int64(len(r.Rows))
+	r.Page = pi
+	return r, nil
 }
 
 // ScriptResult aggregates the execution of several statements.
@@ -348,6 +417,9 @@ func (s *ScriptResult) Summary() string {
 		if l := s.Last(); l != nil && l.Truncated {
 			parts[len(parts)-1] += fmt.Sprintf(" (truncated at %d)", MaxResultRows)
 		}
+		if l := s.Last(); l != nil && l.Page != nil && l.Page.HasMore {
+			parts[len(parts)-1] += " (more available: PgDn/Ctrl+F continues, n/p ±100)"
+		}
 	}
 	if affected > 0 || queries == 0 {
 		parts = append(parts, fmt.Sprintf("%d rows affected", affected))
@@ -386,7 +458,7 @@ func (d *DB) ExecStmt(ctx context.Context, stmt string) (*Result, error) {
 	var err error
 	switch {
 	case kind == KindQuery:
-		r, err = d.QueryEditable(ctx, stmt)
+		r, err = d.queryPaged(ctx, stmt)
 	case kind.IsWrite() || kind == KindOther:
 		r, err = d.execWrite(ctx, stmt, kind)
 	}

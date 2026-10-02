@@ -9,9 +9,8 @@ import (
 	"github.com/mattn/go-runewidth"
 )
 
-// editor.go: a small vi-like multi-line SQL editor. It starts in INSERT
-// mode; Esc switches to NORMAL. VISUAL (charwise) and VISUAL LINE selections
-// are highlighted. Every modification is undoable with 'u'.
+// editor.go: the SQL editor buffer, INSERT/REPLACE modes and rendering.
+// NORMAL/VISUAL command handling (the vi engine) lives in vi.go.
 
 type edMode int
 
@@ -20,10 +19,11 @@ const (
 	modeNormal
 	modeVisual
 	modeVisualLine
+	modeReplace
 )
 
 func (m edMode) String() string {
-	return [...]string{"INSERT", "NORMAL", "VISUAL", "V-LINE"}[m]
+	return [...]string{"INSERT", "NORMAL", "VISUAL", "V-LINE", "REPLACE"}[m]
 }
 
 type edSnap struct {
@@ -31,7 +31,10 @@ type edSnap struct {
 	row, col int
 }
 
-const maxUndo = 500
+const (
+	maxUndo    = 500
+	shiftWidth = 2
+)
 
 type editorModel struct {
 	lines    [][]rune
@@ -40,8 +43,8 @@ type editorModel struct {
 	vrow     int // visual anchor
 	vcol     int
 	undo     []edSnap
+	redo     []edSnap
 	snapped  bool // undo snapshot already taken for this INSERT session
-	pending  string
 	top      int
 	left     int // horizontal scroll in display cells
 	height   int
@@ -50,10 +53,17 @@ type editorModel struct {
 	version  int
 	clsVer   int
 	clsCache [][]uint8
+
+	vi viState // NORMAL/VISUAL command state (vi.go)
+
+	// msg is a one-shot status message for the root model (e.g. "pattern
+	// not found"); msgErr marks it as an error.
+	msg    string
+	msgErr bool
 }
 
 func newEditorModel() *editorModel {
-	return &editorModel{lines: [][]rune{{}}, mode: modeInsert, clsVer: -1}
+	return &editorModel{lines: [][]rune{{}}, mode: modeInsert, clsVer: -1, vi: newViState()}
 }
 
 func (e *editorModel) Text() string {
@@ -87,9 +97,21 @@ func (e *editorModel) setText(s string, undoable bool) {
 
 func (e *editorModel) changed() { e.version++ }
 
+// typing reports whether keys are inserted as text (INSERT / REPLACE).
+func (e *editorModel) typing() bool { return e.mode == modeInsert || e.mode == modeReplace }
+
 func (e *editorModel) title() string {
-	return "SQL [" + e.mode.String() + "] " + itoa(e.row+1) + ":" + itoa(e.col+1)
+	t := "SQL [" + e.mode.String() + "] " + itoa(e.row+1) + ":" + itoa(e.col+1)
+	if e.vi.search.active {
+		return t + "  /" + string(e.vi.search.buf) + "█"
+	}
+	if sc := e.vi.showcmd(); sc != "" {
+		t += "  " + sc
+	}
+	return t
 }
+
+func (e *editorModel) setMsg(s string, isErr bool) { e.msg, e.msgErr = s, isErr }
 
 // cursorOffset returns the byte offset of the cursor within Text().
 func (e *editorModel) cursorOffset() int {
@@ -111,7 +133,7 @@ func (e *editorModel) currentStatement() string {
 	return stmts[i].Text
 }
 
-// ---------------------------------------------------------------- undo
+// ---------------------------------------------------------------- undo / redo
 
 func (e *editorModel) snapshot() edSnap {
 	cp := make([][]rune, len(e.lines))
@@ -121,11 +143,13 @@ func (e *editorModel) snapshot() edSnap {
 	return edSnap{lines: cp, row: e.row, col: e.col}
 }
 
+// pushUndo records the state before a change; a new change clears redo.
 func (e *editorModel) pushUndo() {
 	e.undo = append(e.undo, e.snapshot())
 	if len(e.undo) > maxUndo {
 		e.undo = e.undo[len(e.undo)-maxUndo:]
 	}
+	e.redo = nil
 }
 
 // beforeInsertEdit takes one undo snapshot per INSERT session.
@@ -136,15 +160,46 @@ func (e *editorModel) beforeInsertEdit() {
 	}
 }
 
-func (e *editorModel) doUndo() bool {
-	if len(e.undo) == 0 {
-		return false
+// restore installs a snapshot; like vi the cursor goes to the first line
+// that the undo/redo changed (or the saved position if that line changed).
+func (e *editorModel) restore(s edSnap) {
+	diff := -1
+	for r := 0; r < max(len(e.lines), len(s.lines)); r++ {
+		if r >= len(e.lines) || r >= len(s.lines) || string(e.lines[r]) != string(s.lines[r]) {
+			diff = r
+			break
+		}
 	}
-	s := e.undo[len(e.undo)-1]
-	e.undo = e.undo[:len(e.undo)-1]
 	e.lines, e.row, e.col = s.lines, s.row, s.col
+	if diff >= 0 && diff != s.row {
+		e.row = min(diff, len(e.lines)-1)
+		e.col = firstNonBlank(e.lines[e.row])
+	}
 	e.clampNormal()
 	e.changed()
+}
+
+func (e *editorModel) doUndo() bool {
+	if len(e.undo) == 0 {
+		e.setMsg("already at oldest change", false)
+		return false
+	}
+	e.redo = append(e.redo, e.snapshot())
+	s := e.undo[len(e.undo)-1]
+	e.undo = e.undo[:len(e.undo)-1]
+	e.restore(s)
+	return true
+}
+
+func (e *editorModel) doRedo() bool {
+	if len(e.redo) == 0 {
+		e.setMsg("already at newest change", false)
+		return false
+	}
+	e.undo = append(e.undo, e.snapshot())
+	s := e.redo[len(e.redo)-1]
+	e.redo = e.redo[:len(e.redo)-1]
+	e.restore(s)
 	return true
 }
 
@@ -161,7 +216,7 @@ func (e *editorModel) clampNormal() {
 		e.row = 0
 	}
 	maxc := e.lineLen() - 1
-	if e.mode == modeInsert {
+	if e.typing() {
 		maxc = e.lineLen()
 	}
 	if e.col > maxc {
@@ -184,7 +239,8 @@ func (e *editorModel) exitVisual() {
 	}
 }
 
-// flat position helpers for word motions
+// toIndex / fromIndex convert between (row, col) and an index into the
+// buffer flattened with '\n' line separators.
 func (e *editorModel) toIndex(r, c int) int {
 	idx := 0
 	for i := 0; i < r; i++ {
@@ -194,6 +250,9 @@ func (e *editorModel) toIndex(r, c int) int {
 }
 
 func (e *editorModel) fromIndex(idx int) (int, int) {
+	if idx < 0 {
+		return 0, 0
+	}
 	for i, l := range e.lines {
 		if idx <= len(l) {
 			return i, idx
@@ -206,72 +265,13 @@ func (e *editorModel) fromIndex(idx int) (int, int) {
 
 func (e *editorModel) flatRunes() []rune { return []rune(e.Text()) }
 
-func charClass(r rune) int {
-	switch {
-	case unicode.IsSpace(r):
-		return 0
-	case r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r):
-		return 1
-	default:
-		return 2
+func (e *editorModel) setLinesFromRunes(rs []rune) {
+	parts := strings.Split(string(rs), "\n")
+	e.lines = make([][]rune, len(parts))
+	for i, p := range parts {
+		e.lines[i] = []rune(p)
 	}
-}
-
-func (e *editorModel) wordForward() {
-	rs := e.flatRunes()
-	i := e.toIndex(e.row, e.col)
-	if i >= len(rs) {
-		return
-	}
-	cls := charClass(rs[i])
-	for i < len(rs) && cls != 0 && charClass(rs[i]) == cls {
-		i++
-	}
-	for i < len(rs) && charClass(rs[i]) == 0 {
-		if rs[i] == '\n' && i+1 < len(rs) && rs[i+1] == '\n' {
-			i++
-			break // stop on empty line
-		}
-		i++
-	}
-	if i >= len(rs) {
-		i = max(0, len(rs)-1)
-	}
-	e.row, e.col = e.fromIndex(i)
-}
-
-func (e *editorModel) wordBackward() {
-	rs := e.flatRunes()
-	i := e.toIndex(e.row, e.col) - 1
-	for i > 0 && charClass(rs[i]) == 0 {
-		i--
-	}
-	if i < 0 {
-		i = 0
-	}
-	if i < len(rs) {
-		cls := charClass(rs[i])
-		for i > 0 && charClass(rs[i-1]) == cls && cls != 0 {
-			i--
-		}
-	}
-	e.row, e.col = e.fromIndex(i)
-}
-
-func (e *editorModel) wordEnd() {
-	rs := e.flatRunes()
-	i := e.toIndex(e.row, e.col) + 1
-	for i < len(rs) && charClass(rs[i]) == 0 {
-		i++
-	}
-	if i >= len(rs) {
-		return
-	}
-	cls := charClass(rs[i])
-	for i+1 < len(rs) && charClass(rs[i+1]) == cls {
-		i++
-	}
-	e.row, e.col = e.fromIndex(i)
+	e.changed()
 }
 
 func firstNonBlank(l []rune) int {
@@ -281,6 +281,17 @@ func firstNonBlank(l []rune) int {
 		}
 	}
 	return 0
+}
+
+func leadingSpaces(l []rune) []rune {
+	var out []rune
+	for _, r := range l {
+		if r != ' ' {
+			break
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // ---------------------------------------------------------------- editing primitives
@@ -321,12 +332,7 @@ func (e *editorModel) splitLine(indent bool) {
 	tail := append([]rune(nil), l[c:]...)
 	var pre []rune
 	if indent {
-		for _, r := range head {
-			if r != ' ' {
-				break
-			}
-			pre = append(pre, r)
-		}
+		pre = leadingSpaces(head)
 	}
 	tail = append(pre, tail...)
 	e.lines[e.row] = head
@@ -363,20 +369,24 @@ func (e *editorModel) deleteForward() {
 	e.changed()
 }
 
-func (e *editorModel) deleteLines(from, to int) {
-	var sb []string
-	for i := from; i <= to; i++ {
-		sb = append(sb, string(e.lines[i]))
+// shiftLine indents (dir > 0) or outdents (dir < 0) line r by shiftWidth.
+func (e *editorModel) shiftLine(r, dir int) {
+	l := e.lines[r]
+	if dir > 0 {
+		if len(l) > 0 {
+			e.lines[r] = append([]rune(strings.Repeat(" ", shiftWidth)), l...)
+		}
+	} else {
+		n := 0
+		for n < shiftWidth && n < len(l) && l[n] == ' ' {
+			n++
+		}
+		e.lines[r] = append([]rune(nil), l[n:]...)
 	}
-	e.reg, e.regLine = strings.Join(sb, "\n"), true
-	e.lines = append(e.lines[:from], e.lines[to+1:]...)
-	if len(e.lines) == 0 {
-		e.lines = [][]rune{{}}
-	}
-	e.row = min(from, len(e.lines)-1)
-	e.col = firstNonBlank(e.lines[e.row])
 	e.changed()
 }
+
+// ---------------------------------------------------------------- visual selection
 
 // selection returns the normalized selection (inclusive end for VISUAL).
 func (e *editorModel) selection() (sr, sc, er, ec int) {
@@ -416,72 +426,7 @@ func (e *editorModel) selectionText() (string, bool) {
 	if e.mode != modeVisual && e.mode != modeVisualLine {
 		return "", false
 	}
-	sr, sc, er, ec := e.selection()
-	a := e.toIndex(sr, sc)
-	b := e.toIndex(er, ec) + 1
-	rs := e.flatRunes()
-	if b > len(rs) {
-		b = len(rs)
-	}
-	if a > b {
-		a = b
-	}
-	return string(rs[a:b]), true
-}
-
-func (e *editorModel) deleteSelection() string {
-	text, _ := e.selectionText()
-	sr, sc, er, ec := e.selection()
-	if e.mode == modeVisualLine {
-		e.deleteLines(sr, er)
-		return text
-	}
-	rs := e.flatRunes()
-	a := e.toIndex(sr, sc)
-	b := min(e.toIndex(er, ec)+1, len(rs))
-	nrs := append(append([]rune(nil), rs[:a]...), rs[b:]...)
-	e.setLinesFromRunes(nrs)
-	e.row, e.col = e.fromIndex(a)
-	e.reg, e.regLine = text, false
-	return text
-}
-
-func (e *editorModel) setLinesFromRunes(rs []rune) {
-	parts := strings.Split(string(rs), "\n")
-	e.lines = make([][]rune, len(parts))
-	for i, p := range parts {
-		e.lines[i] = []rune(p)
-	}
-	e.changed()
-}
-
-func (e *editorModel) put(after bool) {
-	if e.reg == "" && !e.regLine {
-		return
-	}
-	e.pushUndo()
-	if e.regLine {
-		var nl [][]rune
-		for _, p := range strings.Split(e.reg, "\n") {
-			nl = append(nl, []rune(p))
-		}
-		at := e.row
-		if after {
-			at++
-		}
-		e.lines = append(e.lines[:at], append(nl, e.lines[at:]...)...)
-		e.row = at
-		e.col = firstNonBlank(e.lines[at])
-		e.changed()
-		return
-	}
-	if after && e.lineLen() > 0 {
-		e.col++
-	}
-	start := e.toIndex(e.row, e.col)
-	e.insertRunes([]rune(e.reg))
-	n := len([]rune(e.reg))
-	e.row, e.col = e.fromIndex(start + n - 1)
+	return e.rangeText(e.visualRange()), true
 }
 
 // ---------------------------------------------------------------- key handling
@@ -489,12 +434,7 @@ func (e *editorModel) put(after bool) {
 // update handles a key; it returns text that should be copied to the system
 // clipboard (from yank operations) or "".
 func (e *editorModel) update(msg tea.KeyMsg) string {
-	defer func() {
-		if e.mode != modeInsert {
-			e.clampNormal()
-		}
-	}()
-	if e.mode != modeInsert {
+	if !e.typing() {
 		e.clampNormal()
 		if msg.Paste && msg.Type == tea.KeyRunes {
 			// bracketed paste inserts text in any mode
@@ -502,23 +442,27 @@ func (e *editorModel) update(msg tea.KeyMsg) string {
 			e.mode = modeInsert
 			e.insertRunes(msg.Runes)
 			e.mode = modeNormal
+			e.clampNormal()
 			return ""
 		}
 	}
-	switch e.mode {
-	case modeInsert:
+	if e.typing() {
 		e.insertKey(msg)
 		return ""
-	case modeNormal:
-		return e.normalKey(msg)
-	default:
-		return e.visualKey(msg)
 	}
+	yank := e.viKey(msg)
+	if !e.typing() {
+		e.clampNormal()
+	}
+	return yank
 }
 
+// insertKey handles INSERT and REPLACE mode keys.
 func (e *editorModel) insertKey(msg tea.KeyMsg) {
+	e.vi.recordInsertKey(msg)
 	switch msg.String() {
 	case "esc":
+		e.vi.finishInsert(e)
 		e.mode = modeNormal
 		if e.col > 0 {
 			e.col--
@@ -528,9 +472,16 @@ func (e *editorModel) insertKey(msg tea.KeyMsg) {
 		e.beforeInsertEdit()
 		e.splitLine(true)
 	case "backspace", "ctrl+h":
+		if e.mode == modeReplace {
+			// REPLACE: backspace only moves left
+			if e.col > 0 {
+				e.col--
+			}
+			return
+		}
 		e.beforeInsertEdit()
 		e.backspace()
-	case "delete", "ctrl+d":
+	case "delete":
 		e.beforeInsertEdit()
 		e.deleteForward()
 	case "ctrl+w":
@@ -554,6 +505,15 @@ func (e *editorModel) insertKey(msg tea.KeyMsg) {
 		e.lines[e.row] = append([]rune(nil), l[c:]...)
 		e.col = 0
 		e.changed()
+	case "ctrl+t", "ctrl+d":
+		e.beforeInsertEdit()
+		before := e.lineLen()
+		dir := 1
+		if msg.String() == "ctrl+d" {
+			dir = -1
+		}
+		e.shiftLine(e.row, dir)
+		e.col = max(0, e.col+e.lineLen()-before)
 	case "left":
 		if e.col > 0 {
 			e.col--
@@ -583,236 +543,42 @@ func (e *editorModel) insertKey(msg tea.KeyMsg) {
 		e.row = min(len(e.lines)-1, e.row+max(1, e.height-1))
 		e.col = min(e.col, e.lineLen())
 	default:
-		if msg.Type == tea.KeyRunes && !msg.Alt {
-			e.beforeInsertEdit()
-			e.insertRunes(msg.Runes)
-		} else if msg.Type == tea.KeySpace {
-			e.beforeInsertEdit()
-			e.insertRunes([]rune{' '})
+		var rs []rune
+		switch {
+		case msg.Type == tea.KeyRunes && !msg.Alt:
+			rs = msg.Runes
+		case msg.Type == tea.KeySpace:
+			rs = []rune{' '}
+		default:
+			return
+		}
+		e.beforeInsertEdit()
+		if e.mode == modeReplace {
+			e.overwriteRunes(rs)
+		} else {
+			e.insertRunes(rs)
 		}
 	}
 }
 
-// motion applies a cursor motion shared by NORMAL and VISUAL modes.
-func (e *editorModel) motion(key string) bool {
-	switch key {
-	case "h", "left", "backspace":
-		if e.col > 0 {
-			e.col--
+// overwriteRunes types over existing characters (REPLACE mode).
+func (e *editorModel) overwriteRunes(rs []rune) {
+	for _, r := range rs {
+		if r == '\n' || r == '\r' {
+			e.splitLine(false)
+			continue
 		}
-	case "l", "right", " ":
-		if e.col < e.lineLen()-1 {
-			e.col++
-		}
-	case "j", "down", "enter":
-		if e.row < len(e.lines)-1 {
-			e.row++
-		}
-	case "k", "up":
-		if e.row > 0 {
-			e.row--
-		}
-	case "w":
-		e.wordForward()
-	case "b":
-		e.wordBackward()
-	case "e":
-		e.wordEnd()
-	case "0", "home":
-		e.col = 0
-	case "^":
-		e.col = firstNonBlank(e.lines[e.row])
-	case "$", "end":
-		e.col = max(0, e.lineLen()-1)
-	case "G":
-		e.row = len(e.lines) - 1
-		e.col = firstNonBlank(e.lines[e.row])
-	case "pgdown", "ctrl+d":
-		e.row = min(len(e.lines)-1, e.row+max(1, e.height/2))
-	case "pgup", "ctrl+u":
-		e.row = max(0, e.row-max(1, e.height/2))
-	default:
-		return false
-	}
-	return true
-}
-
-func (e *editorModel) normalKey(msg tea.KeyMsg) string {
-	key := msg.String()
-	if p := e.pending; p != "" {
-		e.pending = ""
-		switch p + key {
-		case "gg":
-			e.row, e.col = 0, 0
-		case "dd":
-			e.pushUndo()
-			e.deleteLines(e.row, e.row)
-		case "yy":
-			e.reg, e.regLine = string(e.lines[e.row]), true
-			return e.reg
-		case "cc":
-			e.pushUndo()
-			ind := firstNonBlank(e.lines[e.row])
-			e.reg, e.regLine = string(e.lines[e.row]), true
-			e.lines[e.row] = append([]rune(nil), e.lines[e.row][:ind]...)
-			e.col = ind
-			e.changed()
-			e.enterInsert()
-			e.snapped = true
-		}
-		return ""
-	}
-	if e.motion(key) {
-		return ""
-	}
-	switch key {
-	case "g", "d", "y", "c":
-		e.pending = key
-	case "i":
-		e.enterInsert()
-	case "a":
-		e.enterInsert()
-		if e.lineLen() > 0 {
-			e.col++
-		}
-	case "I":
-		e.enterInsert()
-		e.col = firstNonBlank(e.lines[e.row])
-	case "A":
-		e.enterInsert()
-		e.col = e.lineLen()
-	case "o", "O":
-		e.pushUndo()
-		ind := []rune{}
-		for _, r := range e.lines[e.row] {
-			if r != ' ' {
-				break
-			}
-			ind = append(ind, ' ')
-		}
-		at := e.row + 1
-		if key == "O" {
-			at = e.row
-		}
-		e.lines = append(e.lines[:at], append([][]rune{ind}, e.lines[at:]...)...)
-		e.row, e.col = at, len(ind)
-		e.changed()
-		e.enterInsert()
-		e.snapped = true
-	case "x", "delete":
-		if e.lineLen() > 0 {
-			e.pushUndo()
-			e.reg, e.regLine = string(e.lines[e.row][e.col]), false
-			e.deleteForward()
-		}
-	case "X":
-		if e.col > 0 {
-			e.pushUndo()
-			e.backspace()
-		}
-	case "D", "C":
-		e.pushUndo()
 		l := e.lines[e.row]
-		e.reg, e.regLine = string(l[min(e.col, len(l)):]), false
-		e.lines[e.row] = append([]rune(nil), l[:min(e.col, len(l))]...)
-		e.changed()
-		if key == "C" {
-			e.enterInsert()
-			e.snapped = true
-		}
-	case "s":
-		e.pushUndo()
-		if e.lineLen() > 0 {
-			e.deleteForward()
-		}
-		e.enterInsert()
-		e.snapped = true
-	case "J":
-		if e.row+1 < len(e.lines) {
-			e.pushUndo()
-			l := strings.TrimRight(string(e.lines[e.row]), " ")
-			n := strings.TrimLeft(string(e.lines[e.row+1]), " ")
-			joined := l
-			if n != "" {
-				joined += " " + n
-			}
-			e.lines[e.row] = []rune(joined)
-			e.lines = append(e.lines[:e.row+1], e.lines[e.row+2:]...)
-			e.col = len([]rune(l))
+		if e.col < len(l) {
+			nl := append([]rune(nil), l...)
+			nl[e.col] = r
+			e.lines[e.row] = nl
+			e.col++
 			e.changed()
-		}
-	case "p":
-		e.put(true)
-	case "P":
-		e.put(false)
-	case "u":
-		e.doUndo()
-	case "v":
-		e.mode = modeVisual
-		e.vrow, e.vcol = e.row, e.col
-	case "V":
-		e.mode = modeVisualLine
-		e.vrow, e.vcol = e.row, e.col
-	}
-	return ""
-}
-
-func (e *editorModel) visualKey(msg tea.KeyMsg) string {
-	key := msg.String()
-	if e.pending == "g" {
-		e.pending = ""
-		if key == "g" {
-			e.row, e.col = 0, 0
-		}
-		return ""
-	}
-	if e.motion(key) {
-		return ""
-	}
-	switch key {
-	case "g":
-		e.pending = "g"
-	case "esc":
-		e.mode = modeNormal
-	case "v":
-		if e.mode == modeVisual {
-			e.mode = modeNormal
 		} else {
-			e.mode = modeVisual
+			e.insertRunes([]rune{r})
 		}
-	case "V":
-		if e.mode == modeVisualLine {
-			e.mode = modeNormal
-		} else {
-			e.mode = modeVisualLine
-		}
-	case "o":
-		e.row, e.col, e.vrow, e.vcol = e.vrow, e.vcol, e.row, e.col
-	case "y":
-		text, _ := e.selectionText()
-		e.reg, e.regLine = text, e.mode == modeVisualLine
-		sr, sc, _, _ := e.selection()
-		e.row, e.col = sr, sc
-		e.mode = modeNormal
-		return text
-	case "d", "x", "delete":
-		e.pushUndo()
-		e.deleteSelection()
-		e.mode = modeNormal
-	case "c", "s":
-		e.pushUndo()
-		line := e.mode == modeVisualLine
-		sr, _, _, _ := e.selection()
-		e.deleteSelection()
-		if line {
-			e.lines = append(e.lines[:sr], append([][]rune{{}}, e.lines[sr:]...)...)
-			e.row, e.col = sr, 0
-			e.changed()
-		}
-		e.enterInsert()
-		e.snapped = true
 	}
-	return ""
 }
 
 // ---------------------------------------------------------------- view
@@ -831,11 +597,11 @@ func (e *editorModel) classes() [][]uint8 {
 		return e.clsCache
 	}
 	text := e.Text()
-	// byte offset -> (line, rune col)
 	out := make([][]uint8, len(e.lines))
 	for i, l := range e.lines {
 		out[i] = make([]uint8, len(l))
 	}
+	// byte offset -> (line, rune col)
 	lineOf := make([]int32, len(text)+1)
 	colOf := make([]int32, len(text)+1)
 	{
@@ -888,7 +654,10 @@ var clsStyles = map[uint8]lipgloss.Style{
 	clsComment: stComment,
 }
 
+var stSearch = lipgloss.NewStyle().Background(lipgloss.Color("3")).Foreground(lipgloss.Color("0"))
+
 const (
+	stIDSearch = 99
 	stIDSelect = 100
 	stIDCursor = 101
 )
@@ -901,14 +670,8 @@ func (e *editorModel) view(w, h int, focused bool) []string {
 	if e.row >= e.top+h {
 		e.top = e.row - h + 1
 	}
-	gw := len(itoa(len(e.lines)))
-	if gw < 2 {
-		gw = 2
-	}
-	avail := w - gw - 1
-	if avail < 1 {
-		avail = 1
-	}
+	gw := max(2, len(itoa(len(e.lines))))
+	avail := max(1, w-gw-1)
 	// horizontal scroll so the cursor is visible
 	line := e.lines[e.row]
 	cx := runewidth.StringWidth(string(line[:min(e.col, len(line))]))
@@ -940,6 +703,7 @@ func (e *editorModel) view(w, h int, focused bool) []string {
 
 func (e *editorModel) renderLine(i int, cls []uint8, avail int, focused bool) string {
 	l := e.lines[i]
+	matches := e.vi.searchMatches(l)
 	var b strings.Builder
 	var run strings.Builder
 	curStyle := -1
@@ -953,6 +717,8 @@ func (e *editorModel) renderLine(i int, cls []uint8, avail int, focused bool) st
 			b.WriteString(stSelect.Render(s))
 		case curStyle == stIDCursor:
 			b.WriteString(stCursor.Render(s))
+		case curStyle == stIDSearch:
+			b.WriteString(stSearch.Render(s))
 		case curStyle > 0:
 			b.WriteString(clsStyles[uint8(curStyle)].Render(s))
 		default:
@@ -981,6 +747,9 @@ func (e *editorModel) renderLine(i int, cls []uint8, avail int, focused bool) st
 			break
 		}
 		st := int(cls[j])
+		if matches != nil && matches[j] {
+			st = stIDSearch
+		}
 		if e.inSelection(i, j) {
 			st = stIDSelect
 		}

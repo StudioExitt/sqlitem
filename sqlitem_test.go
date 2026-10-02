@@ -570,3 +570,88 @@ func TestGridKeys(t *testing.T) {
 		t.Fatalf("visual d: %#v", m.modal)
 	}
 }
+
+func TestParseLimit(t *testing.T) {
+	cases := []struct {
+		in       string
+		base     string
+		lim, off int64
+		ok       bool
+	}{
+		{"SELECT * FROM t LIMIT 100", "SELECT * FROM t", 100, 0, true},
+		{"select * from t where a in (select b from u limit 3) order by a limit 10 offset 20", "select * from t where a in (select b from u limit 3) order by a", 10, 20, true},
+		{"SELECT * FROM t LIMIT 5, 10", "SELECT * FROM t", 10, 5, true},
+		{"SELECT * FROM t LIMIT ?", "", 0, 0, false},
+		{"SELECT * FROM t LIMIT 10 + 1", "", 0, 0, false},
+		{"SELECT * FROM t", "", 0, 0, false},
+		{"UPDATE t SET a = 1 LIMIT 3", "", 0, 0, false},
+	}
+	for _, c := range cases {
+		base, lim, off, ok := parseLimit(c.in)
+		if ok != c.ok || base != c.base || lim != c.lim || off != c.off {
+			t.Errorf("%q: got %q %d %d %v", c.in, base, lim, off, ok)
+		}
+	}
+}
+
+func TestGridPaging(t *testing.T) {
+	db, _ := openTestDB(t)
+	ctx := context.Background()
+	db.ExecStmt(ctx, "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 247) INSERT INTO users(name, age) SELECT 'u'||i, i FROM n")
+	// 3 + 247 = 250 rows
+	m := &model{db: db, focus: focusEditor, tree: newTreeModel(), editor: newEditorModel(), grid: newGridModel()}
+	m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m.editor.setText("SELECT * FROM users LIMIT 100;", false)
+	keys(m, "f5")
+	g := m.grid
+	if len(g.res.Rows) != 100 || !g.hasMore() || !strings.Contains(g.title(), "▼ more") {
+		t.Fatalf("first page: rows=%d more=%v title=%q", len(g.res.Rows), g.hasMore(), g.title())
+	}
+	if !strings.Contains(strings.Join(g.view(100, 30, true), "\n"), "▼ more rows") {
+		// indicator shows once the last loaded row is on screen
+		keys(m, "G")
+		if !strings.Contains(strings.Join(g.view(100, 30, true), "\n"), "▼ more rows") {
+			t.Error("more-rows indicator missing")
+		}
+	}
+	keys(m, "g", "g")
+	// Ctrl+F through the first page keeps going into the second
+	for i := 0; i < 5; i++ {
+		runCmd(m, m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlF}))
+	}
+	if g.row != 100 || len(g.res.Rows) != 200 {
+		t.Fatalf("continuous paging: row=%d rows=%d status=%q", g.row, len(g.res.Rows), m.status)
+	}
+	// j at the end of loaded rows also continues
+	keys(m, "G")
+	keys(m, "j")
+	if len(g.res.Rows) != 250 || g.row != 200 || g.hasMore() {
+		t.Fatalf("j paging: row=%d rows=%d more=%v", g.row, len(g.res.Rows), g.hasMore())
+	}
+	// rowids follow the appended rows, so editing still works on page 3
+	if g.res.Edit == nil || len(g.res.RowIDs) != 250 || g.res.RowIDs[249] != 250 {
+		t.Fatalf("rowids after paging: %d", len(g.res.RowIDs))
+	}
+	// n / p: within the loaded rows they just move the cursor
+	keys(m, "p")
+	if g.row != 100 {
+		t.Fatalf("p within loaded rows: row=%d", g.row)
+	}
+	// fresh query, then n fetches the next 100-row window
+	keys(m, "f5")
+	keys(m, "n")
+	if g.rowBase() != 100 || g.row != 0 || len(g.res.Rows) != 100 {
+		t.Fatalf("n: base=%d row=%d rows=%d", g.rowBase(), g.row, len(g.res.Rows))
+	}
+	if !strings.Contains(g.title(), "rows 101-200 ▲ ▼ more") {
+		t.Errorf("title: %q", g.title())
+	}
+	keys(m, "n", "n")
+	if g.rowBase() != 200 || len(g.res.Rows) != 50 || g.hasMore() || m.status != "no more rows" {
+		t.Fatalf("last page: base=%d rows=%d more=%v status=%q", g.rowBase(), len(g.res.Rows), g.hasMore(), m.status)
+	}
+	keys(m, "p", "p", "p")
+	if g.rowBase() != 0 || g.row != 0 {
+		t.Fatalf("p back to start: base=%d row=%d", g.rowBase(), g.row)
+	}
+}

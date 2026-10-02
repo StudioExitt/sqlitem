@@ -198,6 +198,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case execDoneMsg:
 		return m, m.handleExecDone(msg)
 
+	case pageLoadedMsg:
+		m.applyPage(msg)
+		return m, nil
+
 	case cellUpdatedMsg:
 		if msg.err != nil {
 			m.setStatus("update failed: "+msg.err.Error(), true)
@@ -453,7 +457,7 @@ func (m *model) colonAllowed() bool {
 	case focusSchema:
 		return !m.tree.searching
 	case focusEditor:
-		return m.editor.mode == modeNormal && m.editor.pending == ""
+		return m.editor.mode == modeNormal && m.editor.vi.idle()
 	case focusGrid:
 		return m.grid.pending == ""
 	}
@@ -481,6 +485,16 @@ func (m *model) cmdlineKey(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
+// takeEditorMsg moves the editor's one-shot message to the status bar.
+func (m *model) takeEditorMsg() bool {
+	if m.editor.msg == "" {
+		return false
+	}
+	m.setStatus(m.editor.msg, m.editor.msgErr)
+	m.editor.msg = ""
+	return true
+}
+
 // runCommand executes a ':' command.
 func (m *model) runCommand(c string) tea.Cmd {
 	switch c {
@@ -489,7 +503,13 @@ func (m *model) runCommand(c string) tea.Cmd {
 	case "q", "q!", "qa", "qa!", "quit", "wq", "x":
 		return tea.Quit
 	}
-	m.setStatus("unknown command: :"+c+"  (available: :q)", true)
+	if m.focus == focusEditor && m.editor.exCommand(c) {
+		if !m.takeEditorMsg() {
+			m.setStatus(":"+c, false)
+		}
+		return nil
+	}
+	m.setStatus("unknown command: :"+c, true)
 	return nil
 }
 
@@ -513,7 +533,7 @@ func (m *model) statusLine() string {
 // helpHint is the right-aligned help reminder in the status bar. In the
 // editor's INSERT mode '?' is typed as text, so F1 is shown instead.
 func (m *model) helpHint() string {
-	if m.focus == focusEditor && m.editor.mode == modeInsert {
+	if m.focus == focusEditor && m.editor.typing() {
 		return " F1: help "
 	}
 	return " ?: help "
@@ -627,11 +647,13 @@ func (m *model) treeKey(msg tea.KeyMsg) tea.Cmd {
 }
 
 func (m *model) editorKey(msg tea.KeyMsg) tea.Cmd {
-	if m.editor.mode != modeInsert && msg.String() == "?" && m.editor.pending == "" {
+	if !m.editor.typing() && msg.String() == "?" && m.editor.vi.idle() {
 		m.modal = newTextModal("Help", strings.Split(helpText, "\n"))
 		return nil
 	}
-	if yank := m.editor.update(msg); yank != "" {
+	yank := m.editor.update(msg)
+	m.takeEditorMsg()
+	if yank != "" {
 		return clipboardCmd("selection", yank)
 	}
 	return nil
@@ -671,17 +693,25 @@ SCHEMA
   /                      filter tables & columns (Enter keep, Esc clear)
   r                      reload schema
 
-SQL EDITOR (vi-like; starts in INSERT)
-  Esc                    INSERT -> NORMAL
-  i a I A o O            enter INSERT
-  h j k l w b e 0 ^ $    motions        gg / G    first / last line
-  x dd D C yy p P        edit / yank / put
-  u                      undo
-  v / V                  VISUAL char / line;  y d c on the selection
+SQL EDITOR (vi; starts in INSERT, Esc -> NORMAL)
+  counts                 3j  5x  2dd  d3w  3p ...
+  move                   h j k l  w b e ge W B E  0 ^ $ g_  gg G 5G  H M L
+                         f F t T + char, ; ,   %  { }  + -  Ctrl+D/U  PgUp/PgDn
+  operators              d c y > < gu gU g~  + motion / text object, doubled = line (dd cc >>)
+  text objects           iw aw iW aW  i( a( ib  i[ i{ i<  i" a" i' a' (and backquote)  ip ap
+  edit                   x X s S r R ~ J gJ D C Y p P o O i a I A
+  undo / redo / repeat   u / U / .
+  visual                 v V, o swap ends, d y c > < u U ~ r J p, iw/i( ... extend
+  search                 /text Enter, n N, * #   (highlighted; :noh clears)
+  marks                  ma  'a (line)  backquote-a (exact)  ''   scroll  zz zt zb Ctrl+E Ctrl+Y
+  ex commands            :N  :$  :s/a/b/[gi]  :%s/a/b/g  :1,5s/..  :Nd  :noh  :u  :redo
+  INSERT keys            Ctrl+W word, Ctrl+U line start, Ctrl+T/Ctrl+D indent/outdent
 
 RESULT GRID
   h j k l, arrows        move one cell
-  Ctrl+F / Ctrl+B        20 rows down / up  (also PgDn / PgUp)
+  Ctrl+F / Ctrl+B        20 rows down / up  (also PgDn / PgUp); past the last
+                         loaded row of a LIMIT query the next page is appended
+  n / p                  100 rows forward / back (loads that page if needed)
   gg, Home / G, End      first / last row      0 / $  first / last column
   v                      start / end VISUAL block selection
   y                      copy cell (VISUAL: copy block as TSV)

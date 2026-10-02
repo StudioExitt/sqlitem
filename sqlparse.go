@@ -747,3 +747,60 @@ func rewriteWithRowID(stmt string, sh SelectShape) string {
 	}
 	return stmt[:sh.selectEnd] + " " + quoteIdent(qual) + ".rowid AS " + RowIDColumn + "," + stmt[sh.selectEnd:]
 }
+
+// parseLimit recognises a trailing top-level "LIMIT n [OFFSET m]" or
+// "LIMIT m, n" with integer literals on a query. It returns the statement
+// without that clause so pages can be fetched with other offsets.
+func parseLimit(stmt string) (base string, limit, offset int64, ok bool) {
+	sig := sigTokens(tokenize(stmt))
+	if len(sig) == 0 || !(sig[0].isKw("SELECT") || sig[0].isKw("WITH") || sig[0].isKw("VALUES")) {
+		return "", 0, 0, false
+	}
+	depth := 0
+	at := -1
+	for i, t := range sig {
+		switch {
+		case t.isPunct("("):
+			depth++
+		case t.isPunct(")"):
+			depth--
+		case depth == 0 && t.isKw("LIMIT"):
+			at = i
+		}
+	}
+	if at < 0 {
+		return "", 0, 0, false
+	}
+	num := func(t token) (int64, bool) {
+		if t.kind != tkNumber {
+			return 0, false
+		}
+		var n int64
+		for _, c := range t.text {
+			if c < '0' || c > '9' {
+				return 0, false
+			}
+			n = n*10 + int64(c-'0')
+		}
+		return n, true
+	}
+	rest := sig[at+1:]
+	switch {
+	case len(rest) == 1:
+		limit, ok = num(rest[0])
+	case len(rest) == 3 && rest[1].isKw("OFFSET"):
+		var ok2 bool
+		limit, ok = num(rest[0])
+		offset, ok2 = num(rest[2])
+		ok = ok && ok2
+	case len(rest) == 3 && rest[1].isPunct(","):
+		var ok2 bool
+		offset, ok = num(rest[0])
+		limit, ok2 = num(rest[2])
+		ok = ok && ok2
+	}
+	if !ok || limit <= 0 {
+		return "", 0, 0, false
+	}
+	return strings.TrimSpace(stmt[:sig[at].start]), limit, offset, true
+}

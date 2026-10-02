@@ -1,2 +1,3 @@
 build/
 *.sqlitem.log.jsonl
+sqlitem
